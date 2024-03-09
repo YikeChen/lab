@@ -1,0 +1,436 @@
+---
+title: "Analyses of Proteomic Abundance Levels"
+author: "Yike Chen"
+date: "2024-02-26"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include=TRUE}
+# Import Library
+suppressPackageStartupMessages({
+  library(readr)
+  library(limma)
+  library(ggplot2)
+  library(impute)
+  library(tidyverse)
+  library(lmtest)
+  library(sandwich)
+})
+```
+
+## 1. Data Prepare (Clean & Merge)
+#### 1.1 First step: Load data, clean data
+
+```{r, include=TRUE}
+covariates <- read_csv("/Users/chenxixi/Desktop/LAB tasks/Task16_Proteomics_Diff/Covariates.csv", show_col_types = FALSE)
+protein_annotation <- read_csv("/Users/chenxixi/Desktop/LAB tasks/Task16_Proteomics_Diff/Protein_Annotation.csv", show_col_types = FALSE)
+protein_matrix <- read_csv("/Users/chenxixi/Desktop/LAB tasks/Task16_Proteomics_Diff/Protein_Matrix.csv", show_col_types = FALSE)
+```
+
+##### Basic Data Reading
+
+```{r, include=TRUE}
+head(covariates, 2) 
+head(protein_annotation, 2)
+head(protein_matrix, 1)
+```
+
+#### 1.2 Checking for missing values
+
+```{r, include=TRUE}
+# Check if each dataset has missing values
+sum(is.na(covariates))
+sum(is.na(protein_annotation))
+sum(is.na(protein_matrix))
+sapply(protein_annotation, function(x) sum(is.na(x)))
+```
+
+I found that covariates.csv dataset has no missing values. The protein_matrix.csv dataset has 50977 missing values, and the protein_annotation.csv dataset has 6 missing values. Specifically, upon examination of the missing values in the protein_annotation dataset, there are 4 missing values in the EntrezGeneID column and 2 missing values in the EntrezGeneSymbol column.
+
+```{r, include=TRUE}
+# Check the specific locations of missing values in the protein_annotation
+missing_indices <- which(is.na(protein_annotation), arr.ind = TRUE)
+print(missing_indices)
+
+missing_EntrezGeneID <- which(is.na(protein_annotation$EntrezGeneID))
+missing_EntrezGeneSymbol <- which(is.na(protein_annotation$EntrezGeneSymbol))
+
+if(length(missing_EntrezGeneID) > 0) {
+  print(protein_annotation[missing_EntrezGeneID, ])
+}
+if(length(missing_EntrezGeneSymbol) > 0) {
+  print(protein_annotation[missing_EntrezGeneSymbol, ])
+}
+
+# Replace missing values in EntrezGeneID and EntrezGeneSymbol with NA.
+protein_annotation$EntrezGeneID[is.na(protein_annotation$EntrezGeneID)] <- NA
+protein_annotation$EntrezGeneSymbol[is.na(protein_annotation$EntrezGeneSymbol)] <- NA
+```
+
+I specifically checked the exact locations of the six missing values in protein_annotation.csv, and replaced them all with 'NA'. Since there aren't many missing values, and this pertains to the specific content of analytes, it doesn't affect my subsequent model building and data analysis. Therefore, I have replaced them all with 'NA' and do not intend to attempt data imputation.
+
+#### 1.3 Impute protein_matrix Missing Values using KNN Method
+```{r, include=FALSE}
+library(naniar)
+
+missing_protein_matrix <- protein_matrix %>%
+  slice_sample(n = 500) 
+
+# Force visualization on the original or downsized dataset
+vis_miss(missing_protein_matrix, warn_large_data = FALSE)
+```
+
+
+Here, due to the lengthy code which is not utilized in subsequent sections, I set include = FALSE for these code snippets. I attempted to visualize the missing value types in the protein_matrix using the vis_miss function. From the plot, it can be observed that the proportion of missing values is 3.8%, which is not substantial. The approximate types of missingness appear to be MCAR. Therefore, I proceeded to use Multiple Imputation to impute the data. Initially, I set the method to 'pmm', but it ran for an extended period, possibly due to the large dataset and insufficient computer memory. I then switched to 'mean', but it also took too long to execute. Consequently, I gived up the Multiple Imputation method.
+
+```{r, include=FALSE}
+# Try to fill the protein_matrix using Multivariate Imputation method was abandoned due to its slow runtime
+
+# library(mice)
+#imputed_data <- mice(protein_matrix, m=3, method='mean', maxit=10)
+#completed_data <- complete(imputed_data, 1)
+```
+
+```{r, include=TRUE}
+# Filling protein_matrix with KNN imputation method
+# Set k
+k <- 5
+
+# Perform KNN imputation
+protein_matrix_completed <- impute.knn(as.matrix(protein_matrix), k = k)$data
+
+# Check if there are any missing values in the protein_matrix
+sum(is.na(protein_matrix_completed))
+```
+
+I change to use KNN imputation instead of regular mean imputation method, since KNN imputation is preferred over mean imputation because it preserves the underlying data structure, utilizes relationships between data points, and generally provides more accurate and contextually relevant estimates. Now, we don't have any missing values.
+
+#### 1.4 Merge data
+```{r, include=TRUE}
+# Merge the Protein Matrix dataset with the Covariates dataset by SampleId
+pm_co_merged <- merge(covariates, protein_matrix_completed, by="SampleId")
+```
+
+Because the Protein Matrix does not include disease_status, I combined the Protein Matrix and covariates to serve as the data foundation for subsequent differential analysis. This is because t-test requires dividing the data into control and experimental groups.
+
+(I have hidden here the basic statistical description of the pm_co_merged using the summary function, as the results are too lengthy)
+```{r, include=FALSE}
+# Use the summary function to view basic statistical descriptions of data
+summary(pm_co_merged)
+```
+
+#### 1.5 Apply the Shapiro-Wilk test to check the normality of the pm_co_merged
+```{r, include=TRUE}
+# Identify columns
+analytes <- names(pm_co_merged)[grep("X[0-9]+\\.[0-9]+", names(pm_co_merged))]
+
+# Apply Shapiro-Wilk test for normality 
+sk_results <- lapply(pm_co_merged[analytes], shapiro.test)
+
+# Convert the result into a dataframe
+sk_results_df <- do.call(rbind, lapply(sk_results, function(x) {
+  data.frame(statistic = x$statistic, p.value = x$p.value)
+}))
+
+# Calculate the percentage of analytes with a p-value less than 0.05.
+p_less_than_0_05 <- sum(sk_results_df$p.value < 0.05) / nrow(sk_results_df)
+p_less_than_0_05
+```
+
+I am here using the Shapiro-Wilk test to check whether the merged data conforms to a normal distribution, because if my data does not significantly deviate from normality, I can proceed with parametric tests, such as the t-test. However, if the data exhibits strong skewness or non-normality, I might use alternative non-parametric tests. However, here, I found that a large portion of the protein expression levels in the dataset, up to 90%, do not follow a normal distribution. So, next, I intend to try improving this by applying a logarithmic transformation to the data.
+
+#### 1.6 Convert pm_co_merged into log format and Apply the Shapiro-Wilk test to check the normality of the pm_co_merged_log
+```{r, include=TRUE}
+# translate data to log
+pm_co_merged_log <- pm_co_merged %>%
+  mutate(across(6:last_col(), log1p))
+
+# Check levels of each specific factor
+table(pm_co_merged_log$Gender)
+table(pm_co_merged_log$PlateId)
+```
+
+After converting pm_co_merged into log format, I renamed it as pm_co_merged_log and checked the levels of each specific factor. I found that all the data here are female, indicating that this task is only to examine whether any of the proteins are associated with female disease status. Therefore, gender is not considered as a covariate in the Linear model differential analysis below.
+
+```{r, include=TRUE}
+analytes_log <- names(pm_co_merged_log)[grep("X[0-9]+\\.[0-9]+", names(pm_co_merged_log))]
+
+# Applying the Shapiro-Wilk normality test on the Log format data 
+sk_results_log <- lapply(pm_co_merged_log[analytes_log], shapiro.test)
+
+# Convert the result into a dataframe
+sk_results_log_df <- do.call(rbind, lapply(sk_results_log, function(x) {
+  data.frame(statistic = x$statistic, p.value = x$p.value)
+}))
+
+# Calculate the percentage of analytes with a p-value less than 0.05.
+p_less_than_0_05_log <- sum(sk_results_log_df$p.value < 0.05) / nrow(sk_results_log_df)
+p_less_than_0_05_log
+```
+
+Now, having converted my data type to the logarithmic base, I retested it using the Shapiro-Wilk test for normal distribution. The result is 53%, which, although still a little high, shows considerable improvement. Additionally, given that the sample size is large and exceeds 30, it is generally considered sufficiently large to invoke the Central Limit Theorem to ensure that the distribution of sample means approximates a normal distribution. Therefore, I have decided to use the t-test in the upcoming differential analysis since the t-test can handle comparisons of sample means. Moreover, I have decided to conduct the differential analysis using the log-transformed dataset, as this will be more conducive to meeting the t-test's assumption of data normality.
+
+## 2a. Run Differential Analysis T-Test without Covariates
+```{r, include=TRUE}
+analyte_columns <- colnames(pm_co_merged_log)[grepl("X[0-9]+\\.[0-9]+", colnames(pm_co_merged_log))]
+
+# Initialize a list to store t-test results
+t_test_results <- list()
+effect_sizes <- numeric(length = length(analyte_columns))
+
+# Perform a t-test for each analytes and calculate the effect size.
+for(i in seq_along(analyte_columns)) {
+  analyte <- analyte_columns[i]
+  formula <- as.formula(paste(analyte, "~ Disease_Status"))
+  t_test_result <- t.test(formula, data = pm_co_merged_log)
+  t_test_results[[analyte]] <- t_test_result$p.value
+  effect_sizes[i] <- t_test_result$estimate[1] - t_test_result$estimate[2] 
+}
+t_test_result
+```
+
+We can observe from the above t-test results that the p-value for analyte X9999.1 is 0.5334, which is greater than 0.05. Additionally, the 95% confidence interval for the difference in means between the two groups is from -0.0992038 to 0.1902239, which is include 0, indicating no significant difference. However, this is only for one analyte, and I need to examine the complete set of t-test results and effect sizes values to make a determination. Therefore, next steps involve preparing for drawing a volcano plot.
+
+```{r, include=TRUE}
+# Adjust p—value
+adj_p_values <- p.adjust(unlist(t_test_results), method = "BH")
+
+# create a dataframe
+results_wo_co_df <- data.frame(
+  analytes = analyte_columns,
+  p_value_wo_co = unlist(t_test_results),
+  adj_p_value_wo_co = adj_p_values,
+  effect_size_wo_co = effect_sizes
+)
+
+head(results_wo_co_df,5)
+```
+
+Here, when performing t-tests on multiple analytes simultaneously, I choose to adjust the p-values. Adjusting the p-values helps to control the FDR, reducing the risk of incorrectly identifying significant differences due to random variation. Additionally, I chose to use the Benjamini-Hochberg method to adjust the p-values, which reliably indicates which differences are statistically significant, thereby enhancing the accuracy and reliability of the results.
+
+#### Find Minimum Adjusted p_value
+```{r, include=TRUE}
+# Set FDR threshold based on adjusted p-value
+
+FDR_threshold <- 0.05
+results_wo_co_df$significant <- results_wo_co_df$adj_p_value_wo_co < FDR_threshold
+results_wo_co_df[which.min(results_wo_co_df$adj_p_value_wo_co), ]
+```
+I find the minimum analyte have minimum adjusted p_value without covariates, which is X14127.240.
+
+## 2b. Volcano Plot for without Covariates
+```{r, include=TRUE}
+# Plot volcano plot without covariates
+
+ggplot(results_wo_co_df, aes(x = effect_size_wo_co, y = -log10(adj_p_value_wo_co), color = significant)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) + 
+  theme_minimal() +
+  labs(x = "Effect Size", y = "-log10(Adjusted P-value)", title = "Volcano Plot without Covariates") +
+  theme(plot.title = element_text(hjust = 0.5))+
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "blue") # Add FDR threshold line
+```
+
+I created a volcano plot using ggplot2, we can find that The effects sizes of the majority of analytes are close to zero, indicating that the expression differences of most proteins between the two conditions are minor. 
+
+However, where insignificant points are plotted in black and significant points 14 of them are plotted in red. Here, significance indicates that the abundance of analytes is significantly influenced by disease status. This plot effectively highlights analytes potentially associated with disease status, serving as prospective candidates for further study. Specifically, these are analytes with adjusted p-values lower than 0.05.
+
+
+## 2c. Significant Count without Covariates (based on FDR threshold)
+```{r, include=TRUE} 
+significant_count_wo_co <- sum(results_wo_co_df$adj_p_value_wo_co < FDR_threshold)
+significant_count_wo_co
+
+# Filter out the names of 14 analytes filtered out based on adjusted p-values below the FDR threshold
+significant_analytes_wo_co <- results_wo_co_df$analyte[results_wo_co_df$adj_p_value_wo_co < FDR_threshold]
+significant_analytes_wo_co
+```                                       
+
+According to the results, it was found that **14** analytes have significant statistical significance. Additionally, I have also printed the corresponding names of these analytes.
+
+## 3a. Run differential analysis Linear Model with covariates
+```{r, include=TRUE}
+effect_sizes <- c()
+original_p_values <- c()
+
+# Run the lm for each protein
+for(i in 6:ncol(pm_co_merged_log)){
+  formula <- as.formula(paste(colnames(pm_co_merged_log)[i], "~ Age + Disease_Status +  PlateId"))
+  model <- lm(formula, data=pm_co_merged_log)
+  summary_model <- summary(model)
+  
+  # Store the coefficient which is effect size
+  effect_size <- summary_model$coefficients["Disease_Status", "Estimate"]
+  p_value <- summary_model$coefficients["Disease_Status", "Pr(>|t|)"]
+  
+  # Append 
+  effect_sizes <- c(effect_sizes, effect_size)
+  original_p_values <- c(original_p_values, p_value)
+}
+
+summary_model
+```
+
+To perform a differential analysis with covariates, I choose to use a linear regression model because we are examining the relationship between a continuous dependent variable and multiple independent variables. 
+
+Based on the output, this is the relationship between one of the analytes and covariates. When all other variables are 0, the log abundance of this protein is 7.524049 (Although in most cases, age is not zero).
+
+The coefficient for Age is 0.001628, indicating that with each increase in age, the log abundance of this protein increases by 0.001628. However, with a p-value of 0.943, which greater than 0.05, it suggests that age does not have a statistically significant effect on the abundance of this protein. 
+
+Similarly, Disease_Status and PlateID have p-values greater than 0.05, indicating no significant statistical significance. This includes the F-statistic 0.8694 and p-value 0.5714, suggesting no significance.
+
+Then, I plan to create the volcano plot with covariates to observe the overall impact of analytes on the disease. Here, I used adjusted p-values as the same reason above.
+
+```{r, include=TRUE}
+adjusted_p_values <- p.adjust(original_p_values, method = "BH")
+
+# Combine the results into a data frame
+results_w_co_df <- data.frame(analytes = colnames(pm_co_merged_log)[6:ncol(pm_co_merged_log)],
+                              p_value_w_co = original_p_values,
+                              adj_p_value_w_co = adjusted_p_values,
+                              effect_size_w_co= effect_sizes)
+head(results_w_co_df,5)
+```
+
+#### Find Minimum Adjusted p_value
+```{r, include=TRUE}
+results_w_co_df$significant <- results_w_co_df$adj_p_value_w_co < FDR_threshold
+results_w_co_df[which.min(results_w_co_df$adj_p_value_w_co), ]
+```
+
+I find the minimum analyte have minimum adjusted p_value with covariates, which is X14127.240 same as the situation without covariates.
+
+## 3b. Volcano Plot for with Covariates
+```{r, include=TRUE}
+ggplot(results_w_co_df, aes(x = effect_size_w_co, y = -log10(adj_p_value_w_co), color = significant)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) +
+  theme_minimal() +
+  labs(x = "Effect Size", y = "-log10(Adjusted P-value)", title = "Volcano Plot with Covariates") +
+  theme(plot.title = element_text(hjust = 0.5))+
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "blue") 
+```
+
+I still mark non-significant points in black and significant points in red, specifically those analytes with adjusted p-values lower than 0.05. The blue line is adjusted p-value = 0.05. Next, I will use these significant analytes to study.
+
+## 3c. Significant Count with Covariates (based on FDR threshold)
+```{r, include=TRUE}
+significant_count_w_co <- sum(results_w_co_df$adj_p_value_w_co < FDR_threshold)
+significant_count_w_co
+
+# Filter out the names of 14 analytes filtered out based on adjusted p-values below the FDR threshold
+significant_analytes_w_co <- results_w_co_df$analyte[results_w_co_df$adj_p_value_w_co < FDR_threshold]
+significant_analytes_w_co
+```
+
+According to the results, it was found that **12** analytes have significant statistical significance. Additionally, I have also printed the corresponding names of these analytes.
+
+## 4.Scatterplot of effects sizes between two analyses
+```{r, include=TRUE}
+# create effects sizes data frame
+effects_data <- data.frame(
+  effect_size_wo_co = results_wo_co_df['effect_size_wo_co'],
+  effect_size_w_co = results_w_co_df['effect_size_w_co']
+)
+head(effects_data,3)
+
+ggplot(effects_data, aes(x = effect_size_wo_co, y = effect_size_w_co)) +
+  geom_point() +
+  theme_minimal() +
+  labs(x = "Effect Size Without Covariates", y = "Effect Size With Covariates", title = "Comparison of Effect Sizes") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "blue")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+The scatter plot helps us to visualize the impact of the presence or absence of covariates on the relationship between proteins' abundance and disease status. 
+
+Points clustered near the origin indicate that the protein abundances are close to zero regardless of whether covariates are considered, suggesting these proteins may not have a significant association with disease status. Conversely, for those points far from the origin, the protein abundances are influenced by the presence or absence of covariates. 
+
+Overall, most points lie below the blue dashed line, indicating that the abundance of most proteins tends to decrease when covariates are taken into account. This may mean that some associations between protein abundances and disease status, which seem strong without considering covariates, actually weaken after adjusting for covariates. This could suggest that some apparent disease-related variations in protein abundance might actually be due to other factors such as age or PlateId.
+
+## Summary
+### Part 1
+```{r, include=TRUE}
+# significant proteins bewteen with and without covariates
+common_significant_analytes <- intersect(significant_analytes_w_co, significant_analytes_wo_co)
+
+# Unique significant proteins without covariates
+unique_analytes_wo_co <- setdiff(significant_analytes_wo_co, significant_analytes_w_co)
+
+# Unique significant proteins with covariates
+unique_analytes_w_co <- setdiff(significant_analytes_w_co, significant_analytes_wo_co)
+
+common_significant_analytes
+unique_analytes_wo_co
+```
+Based on the output, it can be seen that these proteins are significant in both scenarios, including "X10041.3", "X10576.7", "X14127.240", "X16885.49", "X18329.4", "X25291.27", "X2567.5", "X4179.57", "X8289.8", "X9883.29". This suggests that these proteins are worth investigating regardless of the presence of covariates and are significant for the disease.
+
+"X10666.7", "X14011.17", "X2474.54", "X2728.62"
+These four proteins are only statistically significant when covariates are **not** considered, indicating that although they may appear to be related to the disease, they could actually be influenced by other unaccounted factors.
+
+"X13468.5", "X3091.70"
+These two proteins are only statistically significant when covariates are considered, suggesting that the relationship between these proteins and the disease state may be influenced by covariates. In simple terms, the abundance of these proteins in relation to the disease state may depend on other factors.
+
+Finally, as mentioned above, the analyte with the minimum adjusted p-value, which is X14127.240, demonstrates the highest statistical significance regardless of the presence of covariates.
+
+Therefore, in subsequent research, we should focus more on the protein X14127.240.
+
+```{r, include=TRUE}
+significant_analytes_w_co_rows <- results_w_co_df[results_w_co_df$analytes %in% significant_analytes_w_co, ]
+
+# Find the protein with the largest absolute value of coefficient
+max_coef_analyte <- significant_analytes_w_co_rows[which.max(abs(significant_analytes_w_co_rows$effect_size_w_co)), ]
+
+# Find the protein with the smallest absolute value of coefficient
+min_coef_analyte <- significant_analytes_w_co_rows[which.min(abs(significant_analytes_w_co_rows$effect_size_w_co)), ]
+
+max_coef_analyte
+min_coef_analyte
+```
+
+In addition, I have identified the proteins with the largest and smallest coefficients when considering covariates. Among them, protein X9883.29 has the largest effect size, indicating that it is the factor with the greatest impact on our study results when considering covariates. Furthermore, X9883.29 has the highest effect size while having a relatively small adjusted p-value, suggesting that this protein's impact on our study results is particularly significant.
+
+In contrast, protein X13468.5 has the smallest effect size, suggesting that its impact on the study results is minimal when considering covariates. However, despite the small effect size, X13468.5 still has a significant adjusted p-value, indicating that there may be subtle but still significant effects. Therefore, the difference between these two proteins can help us better understand the biological changes in the study subjects.
+
+The specific direction of the research depends on subsequent biological analysis and experimental results, which may require further exploration of the functions of these proteins, their associations with other biological processes, and their roles in specific diseases or physiological conditions.
+
+### Part 2 (Combine Protein_Annotation.csv dataset)
+
+### Filter the rows with specific Analytes
+```{r, include=TRUE}
+filtered_common_significant_analytes <- protein_annotation %>% filter(Analytes %in% common_significant_analytes)
+filtered_common_significant_analytes
+
+filtered_unique_analytes_wo_co <- protein_annotation %>% filter(Analytes %in% unique_analytes_wo_co)
+filtered_unique_analytes_wo_co
+
+filtered_unique_analytes_w_co <- protein_annotation %>% filter(Analytes %in% unique_analytes_w_co)
+filtered_unique_analytes_w_co
+
+highest_adj_p_value_analyte <- protein_annotation %>% filter(Analytes %in% "X14127.240")
+highest_adj_p_value_analyte
+
+highest_coef_analyte <- protein_annotation %>% filter(Analytes %in% "X9883.29")
+highest_coef_analyte
+
+lowest_coef_analyte <- protein_annotation %>% filter(Analytes %in% "X13468.5")
+lowest_coef_analyte
+```
+
+I have filtered significant proteins three times from the protein_annotation dataset based on significant proteins between with and without covariates, Unique significant proteins without covariates and Unique significant proteins with covariates. I have collected all the biological information related to the analyzed molecules (UniProt, EntrezGeneID, EntrezGeneSymbol, etc.).
+
+Currently, we cannot derive further associations for these proteins due to the lack of additional external databases, so I stop here. Therefore, to explore more related information about these proteins, we need to integrate additional external databases for further analysis.
+
+All of these protein worth to study. It is worth noting that the analyte **X14127.240**, with TargetFullName 'Interferon beta,' Target 'IFN-b,' UniProt ID P01574, EntrezGeneID 3456, and EntrezGeneSymbol IFNB1, analyte **X9883.29** , with TargetFullName 'Lactoylglutathione lyase,' Target 'Glyoxalase I,' UniProt ID Q04760, EntrezGeneID 2739, and EntrezGeneSymbol GLO1 and analyte **X13468.5** , with TargetFullName 'Neuralized-like protein 4,' Target 'NEUL4,' UniProt ID Q96JN8, EntrezGeneID 84461, and EntrezGeneSymbol NEURL4.
+Merits further exploration by biologists, as it holds significant biological relevance to female-related disease states statistically.
+
+
+
+
